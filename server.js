@@ -6,6 +6,15 @@ const { getFirestore } = require('firebase-admin/firestore');
 const app = express();
 app.use(express.json());
 
+// ── CORS ──────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 // ── CONFIG ────────────────────────────────────────────────────────────────
 const PORT           = process.env.PORT || 3000;
 const EVOLUTION_URL  = process.env.EVOLUTION_URL;
@@ -180,6 +189,16 @@ app.post('/webhook', async (req, res) => {
 // ── QR CODE ENDPOINT ──────────────────────────────────────────────────────
 app.get('/qrcode', async (req, res) => {
   try {
+    // tenta criar instância primeiro (ignora se já existe)
+    try {
+      await axios.post(
+        `${EVOLUTION_URL}/instance/create`,
+        { instanceName: EVOLUTION_INST, qrcode: true },
+        { headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' } }
+      );
+    } catch(e) { /* instância já existe, ok */ }
+
+    // busca QR
     const r = await axios.get(
       `${EVOLUTION_URL}/instance/connect/${EVOLUTION_INST}`,
       { headers: { apikey: EVOLUTION_KEY } }
