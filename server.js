@@ -16,12 +16,11 @@ app.use((req, res, next) => {
 });
 
 // ── CONFIG
-const PORT          = process.env.PORT || 3000;
-const CLAUDE_KEY    = process.env.CLAUDE_API_KEY;
+const PORT       = process.env.PORT || 3000;
+const CLAUDE_KEY = process.env.CLAUDE_API_KEY;
 const FIREBASE_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
-const ZAPI_INST     = process.env.ZAPI_INSTANCE || '3F264304076872FBFFCF62108CBB360D';
-const ZAPI_TOKEN    = process.env.ZAPI_TOKEN    || '77BAEC435D5417876E2AE81F';
-const ZAPI_URL      = `https://api.z-api.io/instances/${ZAPI_INST}/token/${ZAPI_TOKEN}`;
+const ZAPI_INST  = process.env.ZAPI_INSTANCE || '3F264304076872FBFFCF62108CBB360D';
+const ZAPI_TOKEN = process.env.ZAPI_TOKEN    || '77BAEC435D5417876E2AE81F';
 
 // ── FIREBASE
 let db;
@@ -85,7 +84,12 @@ ESTOQUE:\n${estoque}`;
 
 async function sendWpp(telefone, texto) {
   try {
-    await axios.post(`${ZAPI_URL}/send-text`, { phone: telefone, message: texto });
+    await axios.post(
+      `https://api.z-api.io/instances/${ZAPI_INST}/token/${ZAPI_TOKEN}/send-text`,
+      { phone: telefone, message: texto },
+      { headers: { 'Client-Token': ZAPI_TOKEN } }
+    );
+    console.log(`✅ Mensagem enviada para ${telefone}`);
   } catch(e) {
     console.error('Erro Z-API:', e.response?.data || e.message);
   }
@@ -132,7 +136,10 @@ app.post('/webhook', async (req, res) => {
 
 app.get('/status', async (req, res) => {
   try {
-    const r = await axios.get(`${ZAPI_URL}/status`);
+    const r = await axios.get(
+      `https://api.z-api.io/instances/${ZAPI_INST}/token/${ZAPI_TOKEN}/status`,
+      { headers: { 'Client-Token': ZAPI_TOKEN } }
+    );
     res.json({ ok: true, state: r.data });
   } catch(e) {
     res.status(500).json({ ok: false, error: e.message });
