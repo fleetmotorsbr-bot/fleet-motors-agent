@@ -2,6 +2,10 @@ const express = require('express');
 const axios = require('axios');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
@@ -16,11 +20,9 @@ app.use((req, res, next) => {
 });
 
 // ── CONFIG
-const PORT       = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 const CLAUDE_KEY = process.env.CLAUDE_API_KEY;
 const FIREBASE_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
-const ZAPI_INST  = process.env.ZAPI_INSTANCE || '3F264304076872FBFFCF62108CBB360D';
-const ZAPI_TOKEN = process.env.ZAPI_TOKEN    || '77BAEC435D5417876E2AE81F';
 
 // ── FIREBASE
 let db;
@@ -34,6 +36,9 @@ try {
 }
 
 const conversas = {};
+let sock = null;
+let qrCode = null;
+let isConnected = false;
 
 async function getEstoque() {
   if (!db) return 'Estoque não disponível.';
@@ -46,7 +51,7 @@ async function getEstoque() {
     return snap.docs.map(d => {
       const c = d.data();
       const preco = c.preco ? 'R$ ' + c.preco.toLocaleString('pt-BR') : 'consultar';
-      const km    = c.km    ? c.km.toLocaleString('pt-BR') + ' km' : '';
+      const km = c.km ? c.km.toLocaleString('pt-BR') + ' km' : '';
       const fotos = (c.imagens && c.imagens.length) ? ' fotos: ' + c.imagens.join(', ') : '';
       return `• ${c.nome||'?'} ${c.ano||''} — ${km} — ${preco}${c.versao?' | '+c.versao:''}${fotos}`;
     }).join('\n');
@@ -74,25 +79,12 @@ async function salvarMensagem(telefone, role, texto) {
 }
 
 function buildSystem(estoque) {
-  return `Você é Vitor, consultor de vendas da Fleet Motors — concessionária multimarcas premium no Brasil.
+  return `Você é Mateus, consultor de vendas da Fleet Motors — concessionária multimarcas premium no Brasil.
 Atende clientes pelo WhatsApp de forma natural e humana.
 Fluxo: boas-vindas → intenção → qualificação → apresentar estoque → fotos → financiamento → visita → agendamento.
 Nunca use listas robóticas. Respostas curtas. Máx 3 parágrafos. 1-2 emojis.
 Número Fleet Motors: +55 21 99549-5871
 ESTOQUE:\n${estoque}`;
-}
-
-async function sendWpp(telefone, texto) {
-  try {
-    await axios.post(
-      `https://api.z-api.io/instances/${ZAPI_INST}/token/${ZAPI_TOKEN}/send-text`,
-      { phone: telefone, message: texto },
-      { headers: { 'Client-Token': ZAPI_TOKEN } }
-    );
-    console.log(`✅ Mensagem enviada para ${telefone}`);
-  } catch(e) {
-    console.error('Erro Z-API:', e.response?.data || e.message);
-  }
 }
 
 async function askClaude(system, messages) {
@@ -104,64 +96,118 @@ async function askClaude(system, messages) {
   return res.data.content[0].text;
 }
 
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
-  try {
-    const body = req.body;
-    if (body.fromMe || body.isFromMe) return;
-    const telefone = body.phone || body.chatId?.replace('@c.us','') || body.from;
-    if (!telefone) return;
-    const texto = body.text?.message || body.body || body.message;
-    if (!texto) return;
+async function connectWhatsApp() {
+  const authDir = path.join('/tmp', 'auth_info');
+  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
 
-    console.log(`📩 [${telefone}]: ${texto}`);
-    await salvarMensagem(telefone, 'user', texto);
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-    if (!conversas[telefone]) conversas[telefone] = [];
-    conversas[telefone].push({ role: 'user', content: texto });
-    if (conversas[telefone].length > 20) conversas[telefone] = conversas[telefone].slice(-20);
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+    browser: ['Fleet Motors', 'Chrome', '1.0']
+  });
 
-    const estoque  = await getEstoque();
-    const system   = buildSystem(estoque);
-    const resposta = await askClaude(system, conversas[telefone]);
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-    conversas[telefone].push({ role: 'assistant', content: resposta });
-    await salvarMensagem(telefone, 'assistant', resposta);
-    await sendWpp(telefone, resposta);
+    if (qr) {
+      qrCode = qr;
+      isConnected = false;
+      console.log('📱 QR Code gerado — acesse /qr para ver');
+    }
 
-  } catch(e) {
-    console.error('Erro webhook:', e.message);
-  }
+    if (connection === 'close') {
+      isConnected = false;
+      const shouldReconnect = (lastDisconnect?.error instanceof Boom)
+        ? lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut
+        : true;
+      console.log('❌ Desconectado. Reconectando:', shouldReconnect);
+      if (shouldReconnect) setTimeout(connectWhatsApp, 3000);
+    }
+
+    if (connection === 'open') {
+      isConnected = true;
+      qrCode = null;
+      console.log('✅ WhatsApp conectado!');
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      if (msg.key.fromMe) continue;
+
+      const telefone = msg.key.remoteJid?.replace('@s.whatsapp.net', '');
+      if (!telefone) continue;
+
+      const texto = msg.message?.conversation
+        || msg.message?.extendedTextMessage?.text
+        || msg.message?.imageMessage?.caption
+        || '';
+
+      if (!texto) continue;
+
+      console.log(`📩 [${telefone}]: ${texto}`);
+      await salvarMensagem(telefone, 'user', texto);
+
+      if (!conversas[telefone]) conversas[telefone] = [];
+      conversas[telefone].push({ role: 'user', content: texto });
+      if (conversas[telefone].length > 20) conversas[telefone] = conversas[telefone].slice(-20);
+
+      try {
+        const estoque = await getEstoque();
+        const system = buildSystem(estoque);
+        const resposta = await askClaude(system, conversas[telefone]);
+
+        conversas[telefone].push({ role: 'assistant', content: resposta });
+        await salvarMensagem(telefone, 'assistant', resposta);
+
+        await sock.sendMessage(`${telefone}@s.whatsapp.net`, { text: resposta });
+        console.log(`✅ Resposta enviada para ${telefone}`);
+      } catch(e) {
+        console.error('Erro ao responder:', e.message);
+      }
+    }
+  });
+}
+
+// ── ROTAS
+app.get('/', (req, res) => {
+  res.send(`<h2>Fleet Motors Agent 🚗</h2><p>Status: ${isConnected ? '✅ Conectado' : '❌ Desconectado'}</p>${!isConnected ? '<p><a href="/qr">Ver QR Code</a></p>' : ''}`);
 });
 
-app.get('/status', async (req, res) => {
-  try {
-    const r = await axios.get(
-      `https://api.z-api.io/instances/${ZAPI_INST}/token/${ZAPI_TOKEN}/status`,
-      { headers: { 'Client-Token': ZAPI_TOKEN } }
-    );
-    res.json({ ok: true, state: r.data });
-  } catch(e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+app.get('/qr', (req, res) => {
+  if (isConnected) return res.send('<h2>✅ WhatsApp já conectado!</h2>');
+  if (!qrCode) return res.send('<h2>Aguarde... gerando QR Code</h2><meta http-equiv="refresh" content="3">');
+  res.send(`
+    <h2>Escaneie o QR Code</h2>
+    <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrCode)}" />
+    <p>Abra o WhatsApp → Dispositivos conectados → Conectar dispositivo</p>
+    <meta http-equiv="refresh" content="30">
+  `);
+});
+
+app.get('/status', (req, res) => {
+  res.json({ ok: true, connected: isConnected, qrPending: !!qrCode });
 });
 
 app.post('/enviar', async (req, res) => {
   const { telefone, mensagem } = req.body;
   if (!telefone || !mensagem) return res.status(400).json({ error: 'faltam dados' });
+  if (!isConnected) return res.status(503).json({ error: 'WhatsApp desconectado' });
   try {
-    await sendWpp(telefone, mensagem);
+    await sock.sendMessage(`${telefone}@s.whatsapp.net`, { text: mensagem });
     await salvarMensagem(telefone, 'assistant', mensagem);
-    if (!conversas[telefone]) conversas[telefone] = [];
-    conversas[telefone].push({ role: 'assistant', content: mensagem });
     res.json({ ok: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('<h2>Fleet Motors Agent 🚗</h2><p>Online. Webhook: POST /webhook</p>');
-});
-
+// ── INICIAR
+connectWhatsApp();
 app.listen(PORT, () => console.log(`🚀 Fleet Agent porta ${PORT}`));
